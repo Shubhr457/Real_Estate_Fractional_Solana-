@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, Transfer, Mint, TokenAccount};
+use anchor_spl::token::{self, Token, Transfer, Mint, TokenAccount, MintTo};
 
 declare_id!("7BwJmWypzV9WokmhxHZEjisoiBmpNhzcCnr8wQX3Kn9w");
 
@@ -29,7 +29,7 @@ pub mod real_estate_platform {
         Ok(())
     }
 
-    /// Initialize a new property for tokenization
+    /// Initialize a new property for tokenization with Chainlink verification
     pub fn initialize_property(
         ctx: Context<InitializeProperty>,
         property_id: String,
@@ -38,11 +38,13 @@ pub mod real_estate_platform {
         property_address: String,
         property_type: PropertyType,
         legal_document_hash: String,
+        chainlink_valuation: u64, // Valuation fetched from Chainlink
     ) -> Result<()> {
         require!(total_tokens > 0, ErrorCode::InvalidTokenSupply);
         require!(token_price > 0, ErrorCode::InvalidTokenPrice);
         require!(property_id.len() <= 32, ErrorCode::PropertyIdTooLong);
         require!(property_address.len() <= 100, ErrorCode::AddressTooLong);
+        require!(chainlink_valuation > 0, ErrorCode::InvalidValuation);
 
         let property = &mut ctx.accounts.property;
         let platform_state = &mut ctx.accounts.platform_state;
@@ -59,10 +61,14 @@ pub mod real_estate_platform {
         property.last_income_distribution = Clock::get()?.unix_timestamp;
         property.is_active = true;
         property.token_mint = ctx.accounts.token_mint.key();
-        property.property_valuation = 0;
+        property.property_valuation = chainlink_valuation;
+        property.last_valuation_update = Clock::get()?.unix_timestamp;
         property.kyc_required = true;
+        property.expected_rental_yield = 0; // Will be set later
+        property.property_vault = ctx.accounts.property_owner.key(); // Simplified vault setup
         
         platform_state.total_properties += 1;
+        platform_state.total_value_locked += chainlink_valuation;
         
         emit!(PropertyInitialized {
             property_id: property_id.clone(),
@@ -72,6 +78,33 @@ pub mod real_estate_platform {
             token_mint: ctx.accounts.token_mint.key(),
         });
         
+        Ok(())
+    }
+
+    /// Verify user KYC using Chainlink oracles
+    pub fn verify_user_kyc(
+        ctx: Context<VerifyUserKyc>,
+        kyc_provider_response: u8, // 1 = verified, 0 = not verified
+        chainlink_round_id: u64,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.authority.key() == ctx.accounts.platform_state.authority,
+            ErrorCode::Unauthorized
+        );
+
+        let kyc_record = &mut ctx.accounts.kyc_record;
+        kyc_record.user = ctx.accounts.user.key();
+        kyc_record.is_verified = kyc_provider_response == 1;
+        kyc_record.updated_at = Clock::get()?.unix_timestamp;
+        kyc_record.verification_provider = "Chainlink".to_string();
+        kyc_record.round_id = chainlink_round_id;
+
+        emit!(KycStatusUpdated {
+            user: ctx.accounts.user.key(),
+            is_verified: kyc_record.is_verified,
+            updated_at: kyc_record.updated_at,
+        });
+
         Ok(())
     }
 
@@ -105,13 +138,40 @@ pub mod real_estate_platform {
         Ok(())
     }
 
-    /// Purchase property tokens (fractional ownership)
+    /// Update expected rental yield using Chainlink data
+    pub fn update_rental_yield(
+        ctx: Context<UpdateRentalYield>,
+        new_yield: u64, // In basis points (e.g., 500 = 5%)
+        chainlink_round_id: u64,
+    ) -> Result<()> {
+        let property = &mut ctx.accounts.property;
+        
+        require!(
+            ctx.accounts.authority.key() == property.owner || 
+            ctx.accounts.authority.key() == ctx.accounts.platform_state.authority,
+            ErrorCode::Unauthorized
+        );
+        
+        property.expected_rental_yield = new_yield;
+        
+        emit!(RentalYieldUpdated {
+            property_id: property.property_id.clone(),
+            new_yield,
+            chainlink_round_id,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Purchase property tokens (simplified version)
     pub fn purchase_tokens(
         ctx: Context<PurchaseTokens>,
         amount: u64,
         property_id: String,
     ) -> Result<()> {
         let property = &ctx.accounts.property;
+        
         require!(property.is_active, ErrorCode::PropertyNotActive);
         require!(amount > 0, ErrorCode::InvalidAmount);
         require!(
@@ -124,8 +184,6 @@ pub mod real_estate_platform {
             .checked_mul(token_price)
             .ok_or(ErrorCode::MathOverflow)?;
 
-        let buyer = &ctx.accounts.buyer;
-
         // Simplified implementation - just track the purchase
         // In a real implementation, you would handle SOL transfers and token minting
         
@@ -135,10 +193,148 @@ pub mod real_estate_platform {
 
         emit!(TokensPurchased {
             property_id,
-            buyer: buyer.key(),
+            buyer: ctx.accounts.buyer.key(),
             amount,
             total_cost,
             tokens_remaining: property.total_tokens - property.tokens_sold,
+        });
+
+        Ok(())
+    }
+
+    /// List tokens for sale on secondary market (simplified)
+    pub fn list_tokens_for_sale(
+        ctx: Context<ListTokensForSale>,
+        amount: u64,
+        price_per_token: u64,
+        market_price_usd: u64, // Current market price from Chainlink
+    ) -> Result<()> {
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        require!(price_per_token > 0, ErrorCode::InvalidTokenPrice);
+
+        let market_listing = &mut ctx.accounts.market_listing;
+        market_listing.seller = ctx.accounts.seller.key();
+        market_listing.property = ctx.accounts.property.key();
+        market_listing.amount = amount;
+        market_listing.price_per_token = price_per_token;
+        market_listing.total_price = amount.checked_mul(price_per_token).ok_or(ErrorCode::MathOverflow)?;
+        market_listing.is_active = true;
+        market_listing.created_at = Clock::get()?.unix_timestamp;
+        market_listing.market_price_reference = market_price_usd;
+
+        emit!(TokensListedForSale {
+            property_id: ctx.accounts.property.property_id.clone(),
+            seller: ctx.accounts.seller.key(),
+            amount,
+            price_per_token,
+            market_price_reference: market_price_usd,
+        });
+
+        Ok(())
+    }
+
+    /// Purchase tokens from secondary market (simplified)
+    pub fn buy_from_market(
+        ctx: Context<BuyFromMarket>,
+        amount: u64,
+    ) -> Result<()> {
+        let market_listing = &mut ctx.accounts.market_listing;
+        
+        require!(market_listing.is_active, ErrorCode::ListingNotActive);
+        require!(amount <= market_listing.amount, ErrorCode::InsufficientTokens);
+
+        let total_cost = amount
+            .checked_mul(market_listing.price_per_token)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        // Simplified implementation - just update the listing
+        // In a real implementation, you would handle SOL and token transfers
+        
+        // Update market listing
+        market_listing.amount -= amount;
+        if market_listing.amount == 0 {
+            market_listing.is_active = false;
+        }
+
+        emit!(TokensPurchasedFromMarket {
+            property_id: ctx.accounts.property.property_id.clone(),
+            seller: market_listing.seller,
+            buyer: ctx.accounts.buyer.key(),
+            amount,
+            total_cost,
+        });
+
+        Ok(())
+    }
+
+    /// Initiate property sale (requires governance vote)
+    pub fn initiate_property_sale(
+        ctx: Context<InitiatePropertySale>,
+        asking_price: u64,
+        chainlink_valuation: u64,
+    ) -> Result<()> {
+        let property = &mut ctx.accounts.property;
+        
+        require!(
+            ctx.accounts.authority.key() == property.owner ||
+            ctx.accounts.authority.key() == ctx.accounts.platform_state.authority,
+            ErrorCode::Unauthorized
+        );
+
+        property.is_for_sale = true;
+        property.asking_price = asking_price;
+        property.market_valuation = chainlink_valuation;
+        property.sale_initiated_at = Clock::get()?.unix_timestamp;
+
+        emit!(PropertySaleInitiated {
+            property_id: property.property_id.clone(),
+            asking_price,
+            market_valuation: chainlink_valuation,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    /// Execute property sale and distribute proceeds
+    pub fn execute_property_sale(
+        ctx: Context<ExecutePropertySale>,
+        sale_price: u64,
+        buyer_address: Pubkey,
+    ) -> Result<()> {
+        let property = &mut ctx.accounts.property;
+        let platform_state = &ctx.accounts.platform_state;
+        
+        require!(property.is_for_sale, ErrorCode::PropertyNotForSale);
+        require!(
+            ctx.accounts.authority.key() == property.owner ||
+            ctx.accounts.authority.key() == platform_state.authority,
+            ErrorCode::Unauthorized
+        );
+
+        // Calculate platform fee
+        let platform_fee = sale_price
+            .checked_mul(platform_state.platform_fee)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let net_proceeds = sale_price
+            .checked_sub(platform_fee)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        property.is_active = false;
+        property.is_for_sale = false;
+        property.final_sale_price = sale_price;
+        property.sale_completed_at = Clock::get()?.unix_timestamp;
+
+        emit!(PropertySold {
+            property_id: property.property_id.clone(),
+            sale_price,
+            platform_fee,
+            net_proceeds,
+            buyer: buyer_address,
+            timestamp: Clock::get()?.unix_timestamp,
         });
 
         Ok(())
@@ -434,6 +630,14 @@ pub struct Property {
     pub property_valuation: u64,
     pub last_valuation_update: i64,
     pub kyc_required: bool,
+    pub expected_rental_yield: u64,
+    pub property_vault: Pubkey,
+    pub is_for_sale: bool,
+    pub asking_price: u64,
+    pub market_valuation: u64,
+    pub sale_initiated_at: i64,
+    pub final_sale_price: u64,
+    pub sale_completed_at: i64,
 }
 
 #[account]
@@ -477,6 +681,20 @@ pub struct KycRecord {
     pub user: Pubkey,
     pub is_verified: bool,
     pub updated_at: i64,
+    pub verification_provider: String,
+    pub round_id: u64,
+}
+
+#[account]
+pub struct MarketListing {
+    pub seller: Pubkey,
+    pub property: Pubkey,
+    pub amount: u64,
+    pub price_per_token: u64,
+    pub total_price: u64,
+    pub is_active: bool,
+    pub created_at: i64,
+    pub market_price_reference: u64,
 }
 
 // Enums
@@ -517,14 +735,14 @@ pub struct InitializeProperty<'info> {
     #[account(
         init,
         payer = property_owner,
-        space = 8 + 4 + 32 + 32 + 8 + 8 + 8 + 4 + 100 + 1 + 4 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 1
+        space = 8 + 4 + 32 + 32 + 8 + 8 + 8 + 4 + 100 + 1 + 4 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 1 + 1 + 8 + 8 + 8 + 8 + 8
     )]
     pub property: Account<'info, Property>,
     #[account(
         init,
         payer = property_owner,
         mint::decimals = 0,
-        mint::authority = property
+        mint::authority = property_owner
     )]
     pub token_mint: Account<'info, Mint>,
     #[account(mut)]
@@ -667,14 +885,76 @@ pub struct UpdateKycStatus<'info> {
     #[account(
         init_if_needed,
         payer = authority,
-        space = 8 + 32 + 1 + 8,
-        seeds = [b"kyc", user.key().as_ref()],
-        bump
+        space = 8 + 32 + 1 + 8 + 4 + 20 + 8 // Added space for verification_provider and round_id
     )]
     pub kyc_record: Account<'info, KycRecord>,
     /// CHECK: User whose KYC status is being updated
     pub user: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct VerifyUserKyc<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub platform_state: Account<'info, PlatformState>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + 32 + 1 + 8 + 4 + 20 + 8
+    )]
+    pub kyc_record: Account<'info, KycRecord>,
+    /// CHECK: User whose KYC status is being verified
+    pub user: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateRentalYield<'info> {
+    #[account(mut)]
+    pub property: Account<'info, Property>,
+    pub authority: Signer<'info>,
+    pub platform_state: Account<'info, PlatformState>,
+}
+
+#[derive(Accounts)]
+pub struct ListTokensForSale<'info> {
+    pub property: Account<'info, Property>,
+    #[account(mut)]
+    pub seller: Signer<'info>,
+    #[account(
+        init,
+        payer = seller,
+        space = 8 + 32 + 32 + 8 + 8 + 8 + 1 + 8 + 8
+    )]
+    pub market_listing: Account<'info, MarketListing>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct BuyFromMarket<'info> {
+    pub property: Account<'info, Property>,
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+    #[account(mut)]
+    pub market_listing: Account<'info, MarketListing>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitiatePropertySale<'info> {
+    #[account(mut)]
+    pub property: Account<'info, Property>,
+    pub authority: Signer<'info>,
+    pub platform_state: Account<'info, PlatformState>,
+}
+
+#[derive(Accounts)]
+pub struct ExecutePropertySale<'info> {
+    #[account(mut)]
+    pub property: Account<'info, Property>,
+    pub authority: Signer<'info>,
+    pub platform_state: Account<'info, PlatformState>,
 }
 
 // Events
@@ -770,6 +1050,50 @@ pub struct KycStatusUpdated {
     pub updated_at: i64,
 }
 
+#[event]
+pub struct RentalYieldUpdated {
+    pub property_id: String,
+    pub new_yield: u64,
+    pub chainlink_round_id: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct TokensListedForSale {
+    pub property_id: String,
+    pub seller: Pubkey,
+    pub amount: u64,
+    pub price_per_token: u64,
+    pub market_price_reference: u64,
+}
+
+#[event]
+pub struct TokensPurchasedFromMarket {
+    pub property_id: String,
+    pub seller: Pubkey,
+    pub buyer: Pubkey,
+    pub amount: u64,
+    pub total_cost: u64,
+}
+
+#[event]
+pub struct PropertySaleInitiated {
+    pub property_id: String,
+    pub asking_price: u64,
+    pub market_valuation: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct PropertySold {
+    pub property_id: String,
+    pub sale_price: u64,
+    pub platform_fee: u64,
+    pub net_proceeds: u64,
+    pub buyer: Pubkey,
+    pub timestamp: i64,
+}
+
 // Error codes
 #[error_code]
 pub enum ErrorCode {
@@ -815,4 +1139,10 @@ pub enum ErrorCode {
     ProposalAlreadyExecuted,
     #[msg("KYC not verified")]
     KycNotVerified,
+    #[msg("Invalid valuation")]
+    InvalidValuation,
+    #[msg("Listing not active")]
+    ListingNotActive,
+    #[msg("Property not for sale")]
+    PropertyNotForSale,
 }

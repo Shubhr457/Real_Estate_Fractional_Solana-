@@ -4,6 +4,7 @@ package_manager = "yarn"
 [features]
 resolution = true
 skip-lint = false
+idl-build = ["anchor-spl/idl-build"]
 
 [programs.localnet]
 real_estate = "7BwJmWypzV9WokmhxHZEjisoiBmpNhzcCnr8wQX3Kn9w"

@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, Transfer, Mint, TokenAccount, MintTo};
+use anchor_spl::associated_token::AssociatedToken;
 
 declare_id!("7BwJmWypzV9WokmhxHZEjisoiBmpNhzcCnr8wQX3Kn9w");
 
@@ -19,6 +20,8 @@ pub mod real_estate_platform {
         platform_state.governance_threshold = governance_threshold;
         platform_state.total_properties = 0;
         platform_state.total_value_locked = 0;
+        platform_state.sol_usd_price = 0; // Will be updated via Chainlink
+        platform_state.last_price_update = Clock::get()?.unix_timestamp;
         
         emit!(PlatformInitialized {
             authority: ctx.accounts.authority.key(),
@@ -164,7 +167,7 @@ pub mod real_estate_platform {
         Ok(())
     }
 
-    /// Purchase property tokens (simplified version)
+    /// Purchase property tokens with KYC verification and actual token minting
     pub fn purchase_tokens(
         ctx: Context<PurchaseTokens>,
         amount: u64,
@@ -179,17 +182,56 @@ pub mod real_estate_platform {
             ErrorCode::InsufficientTokens
         );
 
+        // Verify KYC status if required
+        if property.kyc_required {
+            require!(
+                ctx.accounts.kyc_record.is_verified,
+                ErrorCode::KycNotVerified
+            );
+        }
+
         let token_price = property.token_price;
         let total_cost = amount
             .checked_mul(token_price)
             .ok_or(ErrorCode::MathOverflow)?;
 
-        // Simplified implementation - just track the purchase
-        // In a real implementation, you would handle SOL transfers and token minting
-        
+        // Store property key before mutable borrow
+        let property_key = ctx.accounts.property.key();
+
+        // Transfer SOL from buyer to property vault
+        let ix = anchor_lang::solana_program::system_instruction::transfer(
+            &ctx.accounts.buyer.key(),
+            &ctx.accounts.property_vault.key(),
+            total_cost,
+        );
+        anchor_lang::solana_program::program::invoke(
+            &ix,
+            &[
+                ctx.accounts.buyer.to_account_info(),
+                ctx.accounts.property_vault.to_account_info(),
+            ],
+        )?;
+
+        // Mint tokens to buyer
+        let cpi_accounts = MintTo {
+            mint: ctx.accounts.token_mint.to_account_info(),
+            to: ctx.accounts.buyer_token_account.to_account_info(),
+            authority: ctx.accounts.property_owner.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        token::mint_to(cpi_ctx, amount)?;
+
         // Update property
         let property = &mut ctx.accounts.property;
         property.tokens_sold += amount;
+
+        // Update or create investor record
+        let investor_record = &mut ctx.accounts.investor_record;
+        investor_record.investor = ctx.accounts.buyer.key();
+        investor_record.property = property_key; // Use stored key instead of borrowing
+        investor_record.tokens_owned += amount;
+        investor_record.total_invested += total_cost;
 
         emit!(TokensPurchased {
             property_id,
@@ -601,6 +643,30 @@ pub mod real_estate_platform {
 
         Ok(())
     }
+
+    /// Update SOL/USD price using Chainlink price feeds
+    pub fn update_sol_price(
+        ctx: Context<UpdateSolPrice>,
+        new_price: u64, // Price in USD with 8 decimals (e.g., 10000000000 = $100.00)
+        chainlink_round_id: u64,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.authority.key() == ctx.accounts.platform_state.authority,
+            ErrorCode::Unauthorized
+        );
+        
+        let platform_state = &mut ctx.accounts.platform_state;
+        platform_state.sol_usd_price = new_price;
+        platform_state.last_price_update = Clock::get()?.unix_timestamp;
+        
+        emit!(SolPriceUpdated {
+            new_price,
+            chainlink_round_id,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
 }
 
 // Account structures - simplified to reduce stack usage
@@ -611,6 +677,8 @@ pub struct PlatformState {
     pub governance_threshold: u64,
     pub total_properties: u64,
     pub total_value_locked: u64,
+    pub sol_usd_price: u64,
+    pub last_price_update: i64,
 }
 
 #[account]
@@ -720,7 +788,7 @@ pub struct InitializePlatform<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + 32 + 8 + 8 + 8 + 8,
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8,
         seeds = [b"platform"],
         bump
     )]
@@ -768,6 +836,37 @@ pub struct PurchaseTokens<'info> {
     pub property: Account<'info, Property>,
     #[account(mut)]
     pub buyer: Signer<'info>,
+    #[account(
+        seeds = [b"kyc", buyer.key().as_ref()],
+        bump
+    )]
+    pub kyc_record: Account<'info, KycRecord>,
+    #[account(mut)]
+    pub token_mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        associated_token::mint = token_mint,
+        associated_token::authority = buyer
+    )]
+    pub buyer_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        seeds = [b"vault", property.key().as_ref()],
+        bump
+    )]
+    pub property_vault: SystemAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = buyer,
+        space = 8 + 32 + 32 + 8 + 8 + 8 + 8,
+        seeds = [b"investor", property.key().as_ref(), buyer.key().as_ref()],
+        bump
+    )]
+    pub investor_record: Account<'info, InvestorRecord>,
+    /// CHECK: Property owner authority for token minting
+    pub property_owner: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
@@ -957,6 +1056,14 @@ pub struct ExecutePropertySale<'info> {
     pub platform_state: Account<'info, PlatformState>,
 }
 
+#[derive(Accounts)]
+pub struct UpdateSolPrice<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(mut)]
+    pub platform_state: Account<'info, PlatformState>,
+}
+
 // Events
 #[event]
 pub struct PlatformInitialized {
@@ -1091,6 +1198,13 @@ pub struct PropertySold {
     pub platform_fee: u64,
     pub net_proceeds: u64,
     pub buyer: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct SolPriceUpdated {
+    pub new_price: u64,
+    pub chainlink_round_id: u64,
     pub timestamp: i64,
 }
 
